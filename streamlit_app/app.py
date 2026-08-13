@@ -109,10 +109,17 @@ def create_nalog_bytes(worker: dict, day: datetime) -> bytes:
         for w in page.widgets():
             if w.field_name in values:
                 w.field_value = values[w.field_name]
+                # Manja veličina fonta za datume da bolje stanu
+                if w.field_name in ("fill_3", "fill_6", "fill_10", "fill_11_2", "fill_20", "fill_25", "fill_35", "fill_29_2"):
+                    w.text_fontsize = 7.0
+                elif w.field_name in ("fill_7", "fill_6_2", "fill_8", "fill_8_2"):
+                    w.text_fontsize = 8.0
+                elif w.field_name in ("fill_21", "fill_33_2", "fill_24", "fill_34"):
+                    w.text_fontsize = 7.5
                 try:
                     w.update()
                 except Exception:
-                    pass  # neke widgete ponekad ne može da update-uje, ali vrednost ostaje
+                    pass
 
     doc.need_appearances = True
 
