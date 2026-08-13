@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
 Streamlit aplikacija za generisanje PDF službenih putnih naloga.
-Čita podatke iz Google Sheets-a (javni link) ili uploadovanog Excel fajla.
+Koristi fpdf2 (čist Unicode, bez form fields problema).
 """
 
 import streamlit as st
 import openpyxl
 import pandas as pd
-from pypdf import PdfReader, PdfWriter
+from fpdf import FPDF
+from fpdf.enums import XPos, YPos
 from datetime import datetime, timedelta
-import os
+from pathlib import Path
 import re
 import zipfile
 import io
-import tempfile
-from pathlib import Path
 
 # ================== KONFIGURACIJA ==================
-TEMPLATE_PATH = Path(__file__).parent / "template.pdf"
+APP_DIR = Path(__file__).parent
+FONT_PATH = APP_DIR / "DejaVuSans.ttf"
+FONT_BOLD = APP_DIR / "DejaVuSans-Bold.ttf"
 # ==================================================
 
 st.set_page_config(
@@ -31,7 +32,6 @@ st.markdown("Učitaj podatke iz **Google Sheets**-a ili Excel fajla, pa pritisni
 
 
 def parse_date(dstr):
-    """15.08.2026 ili 15.8.2026 → datetime"""
     dstr = str(dstr).strip()
     for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d", "%d/%m/%Y"):
         try:
@@ -41,13 +41,11 @@ def parse_date(dstr):
     raise ValueError(f"Nepoznat format datuma: {dstr}")
 
 
-def format_date(dt):
-    """datetime → 15.8.26.g"""
-    return f"{dt.day}.{dt.month}.{str(dt.year)[2:]}.g"
+def format_date(dt: datetime) -> str:
+    return f"{dt.day:02d}.{dt.month:02d}.{dt.year}."
 
 
-def format_amount(val):
-    """3471 → 3.471,00"""
+def format_amount(val) -> str:
     try:
         num = float(val)
         return f"{num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -55,8 +53,142 @@ def format_amount(val):
         return str(val)
 
 
+class NalogPDF(FPDF):
+    def __init__(self):
+        super().__init__(orientation="P", unit="mm", format="A4")
+        self.set_auto_page_break(auto=True, margin=15)
+        self.add_font("DejaVu", "", str(FONT_PATH))
+        self.add_font("DejaVu", "B", str(FONT_BOLD))
+
+    def header_line(self, text, size=14):
+        self.set_font("DejaVu", "B", size)
+        self.cell(0, 8, text, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+        self.ln(2)
+
+    def label_value(self, label, value, label_w=55):
+        self.set_font("DejaVu", "B", 9)
+        self.cell(label_w, 6, label, new_x=XPos.RIGHT, new_y=YPos.TOP)
+        self.set_font("DejaVu", "", 9)
+        self.multi_cell(0, 6, str(value) if value else "")
+        self.ln(1)
+
+    def section_title(self, text):
+        self.set_font("DejaVu", "B", 11)
+        self.set_fill_color(230, 230, 230)
+        self.cell(0, 7, text, border=1, fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+        self.ln(2)
+
+
+def create_nalog_bytes(worker: dict, day: datetime) -> bytes:
+    """Kreira jedan PDF nalog i vraća ga kao bytes."""
+    pdf = NalogPDF()
+    pdf.add_page()
+
+    date_str = format_date(day)
+    amount = format_amount(worker["dnevni_iznos"])
+    prevoz = f"{worker['prevoz']}, {worker['registracija']}"
+    org = worker["organizacija"]
+    mesto = worker["mesto"]
+
+    # ========== STRANA 1 ==========
+    pdf.header_line("NALOG ZA SLUŽBENO PUTOVANJE")
+    pdf.set_font("DejaVu", "", 9)
+    pdf.cell(0, 5, f"Organizacija: {org}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(3)
+
+    pdf.section_title("PODACI O RADNIKU")
+    pdf.label_value("Radnik:", worker["ime"])
+    pdf.label_value("Radno mesto:", worker["pozicija"])
+    pdf.label_value("Upućuje se na službeni put dana:", date_str)
+    pdf.label_value("Sa zadatkom:", worker["zadatak"])
+    pdf.label_value("Prevozno sredstvo:", prevoz)
+    pdf.label_value("Dnevnica:", f"{amount} RSD")
+    pdf.label_value("Zadržava se najdalje do:", date_str)
+    pdf.label_value("Putni troškovi padaju na teret:", worker["teret"])
+    pdf.label_value("Organizacija (teret):", org)
+    pdf.ln(4)
+
+    pdf.set_font("DejaVu", "", 8)
+    pdf.multi_cell(
+        0, 4,
+        "U roku od 48 časova po povratku sa službenog puta i dolaska na posao, "
+        "podneće pismeni izveštaj o obavljenom službenom poslu. "
+        "Račun o učinjenim putnim troškovima podneti u roku od tri dana."
+    )
+    pdf.ln(6)
+
+    pdf.set_font("DejaVu", "B", 9)
+    pdf.cell(0, 6, "Odobravam isplatu akontacije u iznosu od dinara: _______________", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(8)
+    pdf.cell(90, 6, "(M.P.)", new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.cell(0, 6, "Nalogodavac: ________________", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(10)
+
+    # Putni račun
+    pdf.section_title("PUTNI RAČUN")
+    col_w = [30, 25, 25, 20, 20, 30, 40]
+    headers = ["Datum", "Odlazak", "Povratak", "Km", "Dani", "Iznos", "Ukupno"]
+
+    pdf.set_font("DejaVu", "B", 8)
+    pdf.set_fill_color(240, 240, 240)
+    for i, h in enumerate(headers):
+        pdf.cell(col_w[i], 6, h, border=1, fill=True, align="C")
+    pdf.ln()
+
+    pdf.set_font("DejaVu", "", 8)
+    pdf.cell(col_w[0], 6, date_str, border=1, align="C")
+    pdf.cell(col_w[1], 6, "07:00", border=1, align="C")
+    pdf.cell(col_w[2], 6, "20:00", border=1, align="C")
+    pdf.cell(col_w[3], 6, "13", border=1, align="C")
+    pdf.cell(col_w[4], 6, "1", border=1, align="C")
+    pdf.cell(col_w[5], 6, amount, border=1, align="R")
+    pdf.cell(col_w[6], 6, amount, border=1, align="R")
+    pdf.ln()
+
+    for _ in range(3):
+        for w in col_w:
+            pdf.cell(w, 6, "", border=1)
+        pdf.ln()
+
+    pdf.ln(2)
+    pdf.set_font("DejaVu", "B", 9)
+    pdf.cell(0, 6, f"SVEGA: {amount} RSD", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
+    pdf.ln(2)
+    pdf.set_font("DejaVu", "", 9)
+    pdf.label_value("Primljena akontacija:", amount)
+    pdf.label_value("Ostaje za isplatu/uplatu:", amount)
+    pdf.label_value("Mesto i datum:", f"{mesto}, {date_str}")
+    pdf.ln(6)
+
+    pdf.set_font("DejaVu", "", 8)
+    pdf.cell(60, 6, "Likvidirao: _______________", new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.cell(60, 6, "Rukovodilac: _______________", new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.cell(0, 6, "Nalogodavac: _______________", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    # ========== STRANA 2 ==========
+    pdf.add_page()
+    pdf.header_line("IZVEŠTAJ SA SLUŽBENOG PUTA")
+    pdf.ln(2)
+
+    pdf.set_font("DejaVu", "", 10)
+    pdf.multi_cell(0, 6, "Službeni put protekao po planu i bez vanrednih događaja.")
+    pdf.ln(4)
+
+    pdf.set_font("DejaVu", "", 9)
+    for _ in range(12):
+        pdf.cell(0, 7, "_" * 95, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    pdf.ln(8)
+    pdf.set_font("DejaVu", "B", 9)
+    pdf.cell(0, 6, f"Datum: {date_str}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(0, 6, f"Radnik: {worker['ime']}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(10)
+    pdf.cell(0, 6, "Potpis radnika: ________________________", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    return bytes(pdf.output())
+
+
 def load_workers_from_excel(file_bytes):
-    """Učitava radnike iz Excel fajla (sheet Timovi)."""
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     if "Timovi" not in wb.sheetnames:
         st.error("U Excel fajlu ne postoji sheet sa imenom **Timovi**.")
@@ -67,7 +199,6 @@ def load_workers_from_excel(file_bytes):
         if not row or not row[1]:
             continue
         workers.append({
-            "tim_id": row[0],
             "ime": str(row[1]).strip(),
             "pozicija": str(row[2]).strip() if row[2] else "Službenik obezbeđenja",
             "datum_pocetka": row[3],
@@ -76,7 +207,7 @@ def load_workers_from_excel(file_bytes):
             "zadatak": str(row[9]).strip() if len(row) > 9 and row[9] else "Obavljanje službenog zadatka na terenu",
             "prevoz": str(row[10]).strip() if len(row) > 10 and row[10] else "Ford Fokus 1.4",
             "registracija": str(row[11]).strip() if len(row) > 11 and row[11] else "ZA095LE",
-            "dnevni_iznos": row[12] if len(row) > 12 else 3471,
+            "dnevni_iznos": row[12] if len(row) > 12 and row[12] else 3471,
             "teret": str(row[14]).strip() if len(row) > 14 and row[14] else "poslodavca",
             "organizacija": str(row[15]).strip() if len(row) > 15 and row[15] else "Business Centre - Gold Guard DOO Zaječar",
         })
@@ -84,22 +215,12 @@ def load_workers_from_excel(file_bytes):
 
 
 def load_workers_from_google_sheets(sheet_url: str):
-    """
-    Učitava podatke iz javnog Google Sheets-a preko CSV export-a.
-    Sheet mora biti podešen na 'Anyone with the link can view'.
-    """
-    # Izvuci spreadsheet ID
     match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
     if not match:
         st.error("Neispravan Google Sheets URL.")
         return []
 
     spreadsheet_id = match.group(1)
-
-    # Pokušaj da nađeš gid za sheet "Timovi" (opciono)
-    # Najjednostavnije: koristimo prvi sheet ili eksplicitni gid=0
-    # Korisnik može da doda &gid=XXXXX u URL ako zna
-
     csv_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv&gid=0"
 
     try:
@@ -108,15 +229,13 @@ def load_workers_from_google_sheets(sheet_url: str):
         st.error(f"Ne mogu da učitam Google Sheet. Proveri da li je deljen kao 'Anyone with the link'. Greška: {e}")
         return []
 
-    # Normalizuj imena kolona
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Mapiranje očekivanih kolona
     col_map = {
-        "ime": ["Član tima", "Član tima", "Ime", "Radnik", "Name"],
-        "pozicija": ["Pozicija", "Pozicija", "Radno mesto"],
+        "ime": ["Član tima", "Ime", "Radnik", "Name"],
+        "pozicija": ["Pozicija", "Radno mesto"],
         "datum_pocetka": ["Datum početka", "Datum pocetka", "Početak"],
-        "datum_kraja": ["Datum kraja", "Datum kraja", "Kraj"],
+        "datum_kraja": ["Datum kraja", "Kraj"],
         "mesto": ["Mesto", "Lokacija"],
         "zadatak": ["Zadatak", "Opis posla"],
         "prevoz": ["Prevozno sredstvo", "Prevoz"],
@@ -145,7 +264,6 @@ def load_workers_from_google_sheets(sheet_url: str):
             return default
 
         workers.append({
-            "tim_id": row.get("Tim ID", ""),
             "ime": get("ime"),
             "pozicija": get("pozicija", "Službenik obezbeđenja"),
             "datum_pocetka": get("datum_pocetka"),
@@ -163,79 +281,18 @@ def load_workers_from_google_sheets(sheet_url: str):
 
 def generate_pdfs(workers) -> bytes:
     """Generiše sve PDF-ove i vraća ZIP kao bytes."""
-    if not TEMPLATE_PATH.exists():
-        raise FileNotFoundError(f"Template nije pronađen: {TEMPLATE_PATH}")
-
     zip_buffer = io.BytesIO()
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
         for w in workers:
             start = parse_date(w["datum_pocetka"])
             end = parse_date(w["datum_kraja"])
-            prevoz_full = f"{w['prevoz']}, {w['registracija']}"
-            amount_str = format_amount(w["dnevni_iznos"])
-            amount_rsd = f"{amount_str} RSD"
-            org_short = "Business Centre - Gold Guard"
-            org_full = w["organizacija"]
-            mesto = w["mesto"]
-            mesto_loc = "Zaječaru" if mesto == "Zaječar" else (mesto + "u" if mesto and not mesto.endswith("u") else mesto)
-
             current = start
             while current <= end:
-                date_str = format_date(current)
-
-                reader = PdfReader(str(TEMPLATE_PATH))
-                writer = PdfWriter()
-                writer.append(reader)
-
-                field_values = {
-                    "fill_2": org_short,
-                    "fill_7": w["ime"],
-                    "fill_8": w["pozicija"],
-                    "fill_10": date_str,
-                    "fill_17": prevoz_full,
-                    "fill_19": amount_rsd,
-                    "fill_20": date_str,
-                    "fill_21": org_full,
-                    "fill_3": date_str,
-                    "fill_6": date_str,
-                    "fill_4": "07",
-                    "fill_5": "20",
-                    "fill_90": "13",
-                    "fill_91": "1",
-                    "fill_45": amount_str,
-                    "fill_29": amount_str,
-                    "fill_41": amount_str,
-                    "fill_87": amount_str,
-                    "fill_89": amount_str,
-                    "fill_24": mesto_loc,
-                    "fill_25": date_str,
-                    "fill_34": mesto_loc,
-                    "fill_35": date_str,
-                    "fill_33": w["teret"],
-                    "fill_3_2": org_short,
-                    "fill_6_2": w["ime"],
-                    "fill_8_2": w["pozicija"],
-                    "fill_11_2": date_str,
-                    "fill_24_2": prevoz_full,
-                    "fill_27": amount_rsd,
-                    "fill_29_2": date_str,
-                    "fill_33_2": org_full,
-                    "fill_2_2": "Službeni put protekao po planu i bez vanrednih događaja.",
-                    "fill_13": w["zadatak"],
-                    "fill_16_2": w["zadatak"],
-                }
-
-                for page in writer.pages:
-                    writer.update_page_form_field_values(page, field_values, auto_regenerate=False)
-
+                pdf_bytes = create_nalog_bytes(w, current)
                 safe_name = re.sub(r"[^\w\s-]", "", w["ime"]).replace(" ", "_")
                 filename = f"{safe_name}_{current.strftime('%Y%m%d')}.pdf"
-
-                pdf_bytes = io.BytesIO()
-                writer.write(pdf_bytes)
-                zipf.writestr(filename, pdf_bytes.getvalue())
-
+                zipf.writestr(filename, pdf_bytes)
                 current += timedelta(days=1)
 
     zip_buffer.seek(0)
@@ -279,7 +336,6 @@ with tab1:
         preview_df = pd.DataFrame(workers)[["ime", "pozicija", "datum_pocetka", "datum_kraja", "mesto", "prevoz"]]
         st.dataframe(preview_df, use_container_width=True)
 
-        # Izračunaj koliko PDF-ova će biti
         total_pdfs = 0
         for w in workers:
             try:
@@ -293,7 +349,7 @@ with tab1:
 
         st.subheader("3. Generisanje")
         if st.button("🚀 GENERIŠI PDF NALOGE", type="primary", use_container_width=True):
-            with st.spinner(f"Generišem {total_pdfs} PDF-ova... Ovo može potrajati 20–60 sekundi."):
+            with st.spinner(f"Generišem {total_pdfs} PDF-ova... Ovo može potrajati 10–40 sekundi."):
                 try:
                     zip_bytes = generate_pdfs(workers)
                     st.success(f"✅ Uspešno generisano **{total_pdfs}** PDF naloga!")
@@ -323,13 +379,12 @@ with tab2:
    - Kopiraj link i nalepi ga u aplikaciju
 
 3. **Pritisni dugme „GENERIŠI PDF NALOGE“**
-   - Aplikacija će napraviti po jedan PDF za svaki dan svakog radnika
+   - Aplikacija pravi po jedan čist PDF za svaki dan svakog radnika
    - Dobiješ ZIP fajl za preuzimanje
 
 ### Napomene
-- Template PDF je ugrađen u aplikaciju.
-- Generisanje 100 PDF-ova traje obično 20–50 sekundi.
-- Specijalni karakteri (ć, č, đ, š, ž) su podržani.
+- PDF-ovi se generišu pomoću **fpdf2** + DejaVu font → puna podrška za srpska slova.
+- Nema više problema sa form fields / rotacijom / nevidljivim tekstom.
 """)
 
 st.markdown("---")
