@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Streamlit – popunjavanje ORIGINALNOG PDF obrasca.
-Ugrađuje DejaVu font da bi srpska slova i ceo tekst bili vidljivi.
+Streamlit – originalni PDF obrazac.
+Vrednosti se upisuju, appearance se NE generiše od nas –
+čitač (Chrome/Adobe) sam iscrtava tekst lepo (kao kad klikneš u polje).
 """
 
 import streamlit as st
@@ -20,7 +21,7 @@ FONT_PATH = APP_DIR / "DejaVuSans.ttf"
 
 st.set_page_config(page_title="Generisanje putnih naloga", page_icon="📄", layout="centered")
 st.title("📄 Generisanje službenih putnih naloga")
-st.markdown("Originalni obrazac + ispravno prikazivanje teksta.")
+st.markdown("Originalni obrazac. Tekst se iscrtava ispravno u Chrome / Adobe.")
 
 
 def parse_date(dstr):
@@ -48,9 +49,13 @@ def format_amount(val) -> str:
 def create_nalog_bytes(worker: dict, day: datetime) -> bytes:
     doc = pymupdf.open(str(TEMPLATE_PATH))
 
-    # Ugradi Unicode font na svaku stranu
-    for page in doc:
-        page.insert_font(fontname="F0", fontfile=str(FONT_PATH))
+    # Ugradi font (pomaže nekim čitačima)
+    if FONT_PATH.exists():
+        for page in doc:
+            try:
+                page.insert_font(fontname="F0", fontfile=str(FONT_PATH))
+            except Exception:
+                pass
 
     date_str = format_date(day)
     amount = format_amount(worker["dnevni_iznos"])
@@ -98,35 +103,28 @@ def create_nalog_bytes(worker: dict, day: datetime) -> bytes:
         "fill_16_2": worker["zadatak"],
     }
 
-    # Polja koja moraju da koriste Unicode font
-    unicode_fields = {
-        "fill_7", "fill_8", "fill_21", "fill_24", "fill_34", "fill_33",
-        "fill_6_2", "fill_8_2", "fill_33_2", "fill_2_2", "fill_13", "fill_16_2",
-        "fill_2", "fill_3_2", "fill_17", "fill_24_2", "fill_19", "fill_27",
-    }
-
+    # 1. Upiši vrednosti (bez generisanja appearance-a)
     for page in doc:
         for w in page.widgets():
-            if w.field_name not in values:
-                continue
-            w.field_value = values[w.field_name]
+            if w.field_name in values:
+                w.field_value = values[w.field_name]
 
-            if w.field_name in unicode_fields:
-                w.text_font = "F0"
-                w.text_fontsize = 8.5
-            else:
-                # datumi i brojevi – malo manji da stanu
-                if w.field_name in ("fill_3", "fill_6", "fill_10", "fill_11_2", "fill_20", "fill_25", "fill_35", "fill_29_2"):
-                    w.text_fontsize = 8.0
-                else:
-                    w.text_fontsize = 9.0
+    # 2. Obriši postojeće /AP streamove → čitač mora da regeneriše
+    for page in doc:
+        for w in page.widgets():
+            if w.field_name in values:
+                try:
+                    xref = w.xref
+                    if xref:
+                        ap = doc.xref_get_key(xref, "AP")
+                        if ap and ap[0] != "null":
+                            doc.xref_set_key(xref, "AP", "null")
+                except Exception:
+                    pass
 
-            try:
-                w.update()
-            except Exception:
-                pass
-
+    # 3. NeedAppearances = True  (najvažnije)
     doc.need_appearances = True
+
     pdf_bytes = doc.tobytes(garbage=3, deflate=True)
     doc.close()
     return pdf_bytes
@@ -265,6 +263,13 @@ with tab1:
                     st.exception(e)
 
 with tab2:
-    st.markdown("Koristi se **originalni PDF obrazac**. Font DejaVu je ugrađen da bi se sav tekst (uključujući ć, č, š, ž, đ) lepo video.")
+    st.markdown("""
+**Kako radi sada:**
+- Vrednosti se upisuju u originalni obrazac
+- Stari (pokvareni) izgled polja se briše
+- `NeedAppearances = true` → **Chrome / Adobe** sami iscrtaju tekst lepo (isto kao kad klikneš u polje i nešto upišeš)
 
-st.caption("Originalni template + ugrađeni Unicode font")
+Otvori generisani PDF u **Chrome** ili **Adobe Acrobat** – tada će sva problematična polja izgledati ispravno.
+""")
+
+st.caption("Originalni template • NeedAppearances")
