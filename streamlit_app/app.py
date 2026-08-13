@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Streamlit – generisanje PDF naloga.
-Koristi fpdf2 + DejaVu (puna vidljivost, srpska slova, ista struktura podataka).
+Streamlit – popunjavanje ORIGINALNOG PDF obrasca.
+Ugrađuje DejaVu font da bi srpska slova i ceo tekst bili vidljivi.
 """
 
 import streamlit as st
 import openpyxl
 import pandas as pd
-from fpdf import FPDF
-from fpdf.enums import XPos, YPos
+import pymupdf
 from datetime import datetime, timedelta
 from pathlib import Path
 import re
@@ -16,12 +15,12 @@ import zipfile
 import io
 
 APP_DIR = Path(__file__).parent
+TEMPLATE_PATH = APP_DIR / "template.pdf"
 FONT_PATH = APP_DIR / "DejaVuSans.ttf"
-FONT_BOLD = APP_DIR / "DejaVuSans-Bold.ttf"
 
 st.set_page_config(page_title="Generisanje putnih naloga", page_icon="📄", layout="centered")
 st.title("📄 Generisanje službenih putnih naloga")
-st.markdown("Učitaj podatke iz **Google Sheets**-a ili Excel fajla i generiši PDF-ove.")
+st.markdown("Originalni obrazac + ispravno prikazivanje teksta.")
 
 
 def parse_date(dstr):
@@ -35,7 +34,7 @@ def parse_date(dstr):
 
 
 def format_date(dt: datetime) -> str:
-    return f"{dt.day:02d}.{dt.month:02d}.{dt.year}."
+    return f"{dt.day}.{dt.month}.{str(dt.year)[2:]}.g"
 
 
 def format_amount(val) -> str:
@@ -46,142 +45,97 @@ def format_amount(val) -> str:
         return str(val)
 
 
-class NalogPDF(FPDF):
-    def __init__(self):
-        super().__init__(orientation="P", unit="mm", format="A4")
-        self.set_auto_page_break(auto=True, margin=12)
-        self.add_font("DejaVu", "", str(FONT_PATH))
-        self.add_font("DejaVu", "B", str(FONT_BOLD))
-
-    def header_line(self, text, size=13):
-        self.set_font("DejaVu", "B", size)
-        self.cell(0, 7, text, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
-        self.ln(1)
-
-    def label_value(self, label, value, label_w=52):
-        self.set_font("DejaVu", "B", 9)
-        self.cell(label_w, 5.5, label, new_x=XPos.RIGHT, new_y=YPos.TOP)
-        self.set_font("DejaVu", "", 9)
-        self.multi_cell(0, 5.5, str(value) if value else "")
-        self.ln(0.5)
-
-    def section_title(self, text):
-        self.set_font("DejaVu", "B", 10)
-        self.set_fill_color(235, 235, 235)
-        self.cell(0, 6.5, text, border=1, fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
-        self.ln(1.5)
-
-
 def create_nalog_bytes(worker: dict, day: datetime) -> bytes:
-    pdf = NalogPDF()
-    pdf.add_page()
+    doc = pymupdf.open(str(TEMPLATE_PATH))
+
+    # Ugradi Unicode font na svaku stranu
+    for page in doc:
+        page.insert_font(fontname="F0", fontfile=str(FONT_PATH))
 
     date_str = format_date(day)
     amount = format_amount(worker["dnevni_iznos"])
+    amount_rsd = f"{amount} RSD"
     prevoz = f"{worker['prevoz']}, {worker['registracija']}"
-    org = worker["organizacija"]
-    mesto = worker["mesto"]
+    org_short = "Business Centre - Gold Guard"
+    org_full = worker["organizacija"]
+    mesto_loc = "Zaječaru" if worker["mesto"] == "Zaječar" else worker["mesto"]
 
-    # ===== STRANA 1: NALOG =====
-    pdf.header_line("NALOG ZA SLUŽBENO PUTOVANJE")
-    pdf.set_font("DejaVu", "", 9)
-    pdf.cell(0, 5, f"Organizacija: {org}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(2)
+    values = {
+        "fill_2": org_short,
+        "fill_7": worker["ime"],
+        "fill_8": worker["pozicija"],
+        "fill_10": date_str,
+        "fill_17": prevoz,
+        "fill_19": amount_rsd,
+        "fill_20": date_str,
+        "fill_21": org_full,
+        "fill_3": date_str,
+        "fill_6": date_str,
+        "fill_4": "07",
+        "fill_5": "20",
+        "fill_90": "13",
+        "fill_91": "1",
+        "fill_45": amount,
+        "fill_29": amount,
+        "fill_41": amount,
+        "fill_87": amount,
+        "fill_89": amount,
+        "fill_24": mesto_loc,
+        "fill_25": date_str,
+        "fill_34": mesto_loc,
+        "fill_35": date_str,
+        "fill_33": worker["teret"],
+        "fill_3_2": org_short,
+        "fill_6_2": worker["ime"],
+        "fill_8_2": worker["pozicija"],
+        "fill_11_2": date_str,
+        "fill_24_2": prevoz,
+        "fill_27": amount_rsd,
+        "fill_29_2": date_str,
+        "fill_33_2": org_full,
+        "fill_2_2": "Službeni put protekao po planu i bez vanrednih događaja.",
+        "fill_13": worker["zadatak"],
+        "fill_16_2": worker["zadatak"],
+    }
 
-    pdf.section_title("PODACI O RADNIKU")
-    pdf.label_value("Radnik:", worker["ime"])
-    pdf.label_value("Radno mesto:", worker["pozicija"])
-    pdf.label_value("Upućuje se na službeni put dana:", date_str)
-    pdf.label_value("Sa zadatkom:", worker["zadatak"])
-    pdf.label_value("Prevozno sredstvo:", prevoz)
-    pdf.label_value("Dnevnica:", f"{amount} RSD")
-    pdf.label_value("Zadržava se najdalje do:", date_str)
-    pdf.label_value("Putni troškovi padaju na teret:", worker["teret"])
-    pdf.label_value("Organizacija (teret):", org)
-    pdf.ln(3)
+    # Polja koja moraju da koriste Unicode font
+    unicode_fields = {
+        "fill_7", "fill_8", "fill_21", "fill_24", "fill_34", "fill_33",
+        "fill_6_2", "fill_8_2", "fill_33_2", "fill_2_2", "fill_13", "fill_16_2",
+        "fill_2", "fill_3_2", "fill_17", "fill_24_2", "fill_19", "fill_27",
+    }
 
-    pdf.set_font("DejaVu", "", 8)
-    pdf.multi_cell(0, 4,
-        "U roku od 48 časova po povratku sa službenog puta i dolaska na posao, "
-        "podneće pismeni izveštaj o obavljenom službenom poslu. "
-        "Račun o učinjenim putnim troškovima podneti u roku od tri dana.")
-    pdf.ln(4)
+    for page in doc:
+        for w in page.widgets():
+            if w.field_name not in values:
+                continue
+            w.field_value = values[w.field_name]
 
-    pdf.set_font("DejaVu", "B", 9)
-    pdf.cell(0, 5.5, "Odobravam isplatu akontacije u iznosu od dinara: _______________", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(6)
-    pdf.cell(90, 5.5, "(M.P.)", new_x=XPos.RIGHT, new_y=YPos.TOP)
-    pdf.cell(0, 5.5, "Nalogodavac: ________________", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(6)
+            if w.field_name in unicode_fields:
+                w.text_font = "F0"
+                w.text_fontsize = 8.5
+            else:
+                # datumi i brojevi – malo manji da stanu
+                if w.field_name in ("fill_3", "fill_6", "fill_10", "fill_11_2", "fill_20", "fill_25", "fill_35", "fill_29_2"):
+                    w.text_fontsize = 8.0
+                else:
+                    w.text_fontsize = 9.0
 
-    # Putni račun
-    pdf.section_title("PUTNI RAČUN")
-    col_w = [28, 24, 24, 18, 18, 28, 40]
-    headers = ["Datum", "Odlazak", "Povratak", "Km", "Dani", "Iznos", "Ukupno"]
+            try:
+                w.update()
+            except Exception:
+                pass
 
-    pdf.set_font("DejaVu", "B", 8)
-    pdf.set_fill_color(240, 240, 240)
-    for i, h in enumerate(headers):
-        pdf.cell(col_w[i], 5.5, h, border=1, fill=True, align="C")
-    pdf.ln()
-
-    pdf.set_font("DejaVu", "", 8)
-    pdf.cell(col_w[0], 5.5, date_str, border=1, align="C")
-    pdf.cell(col_w[1], 5.5, "07:00", border=1, align="C")
-    pdf.cell(col_w[2], 5.5, "20:00", border=1, align="C")
-    pdf.cell(col_w[3], 5.5, "13", border=1, align="C")
-    pdf.cell(col_w[4], 5.5, "1", border=1, align="C")
-    pdf.cell(col_w[5], 5.5, amount, border=1, align="R")
-    pdf.cell(col_w[6], 5.5, amount, border=1, align="R")
-    pdf.ln()
-
-    for _ in range(2):
-        for w in col_w:
-            pdf.cell(w, 5.5, "", border=1)
-        pdf.ln()
-
-    pdf.ln(1)
-    pdf.set_font("DejaVu", "B", 9)
-    pdf.cell(0, 5.5, f"SVEGA: {amount} RSD", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
-    pdf.ln(1)
-    pdf.set_font("DejaVu", "", 9)
-    pdf.label_value("Primljena akontacija:", amount)
-    pdf.label_value("Ostaje za isplatu/uplatu:", amount)
-    pdf.label_value("Mesto i datum:", f"{mesto}, {date_str}")
-    pdf.ln(4)
-
-    pdf.set_font("DejaVu", "", 8)
-    pdf.cell(60, 5.5, "Likvidirao: _______________", new_x=XPos.RIGHT, new_y=YPos.TOP)
-    pdf.cell(60, 5.5, "Rukovodilac: _______________", new_x=XPos.RIGHT, new_y=YPos.TOP)
-    pdf.cell(0, 5.5, "Nalogodavac: _______________", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
-    # ===== STRANA 2: IZVEŠTAJ =====
-    pdf.add_page()
-    pdf.header_line("IZVEŠTAJ SA SLUŽBENOG PUTA")
-    pdf.ln(2)
-
-    pdf.set_font("DejaVu", "", 10)
-    pdf.multi_cell(0, 5.5, "Službeni put protekao po planu i bez vanrednih događaja.")
-    pdf.ln(3)
-
-    pdf.set_font("DejaVu", "", 9)
-    for _ in range(10):
-        pdf.cell(0, 6.5, "_" * 95, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
-    pdf.ln(6)
-    pdf.set_font("DejaVu", "B", 9)
-    pdf.cell(0, 5.5, f"Datum: {date_str}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 5.5, f"Radnik: {worker['ime']}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(8)
-    pdf.cell(0, 5.5, "Potpis radnika: ________________________", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
-    return bytes(pdf.output())
+    doc.need_appearances = True
+    pdf_bytes = doc.tobytes(garbage=3, deflate=True)
+    doc.close()
+    return pdf_bytes
 
 
 def load_workers_from_excel(file_bytes):
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     if "Timovi" not in wb.sheetnames:
-        st.error("U Excel fajlu ne postoji sheet **Timovi**.")
+        st.error("Nema sheet-a **Timovi**.")
         return []
     ws = wb["Timovi"]
     workers = []
@@ -214,7 +168,7 @@ def load_workers_from_google_sheets(sheet_url: str):
     try:
         df = pd.read_csv(csv_url)
     except Exception as e:
-        st.error(f"Ne mogu da učitam Google Sheet. Proveri deljenje (Anyone with the link). Greška: {e}")
+        st.error(f"Ne mogu da učitam Sheet: {e}")
         return []
     df.columns = [str(c).strip() for c in df.columns]
     col_map = {
@@ -276,38 +230,34 @@ def generate_pdfs(workers) -> bytes:
 
 
 # ===== UI =====
-tab1, tab2 = st.tabs(["📊 Google Sheets / Excel", "ℹ️ Uputstvo"])
+tab1, tab2 = st.tabs(["📊 Podaci", "ℹ️ Uputstvo"])
 
 with tab1:
-    st.subheader("1. Izvor podataka")
-    source = st.radio("Odakle učitavam podatke?", ["Upload Excel fajla (.xlsx)", "Google Sheets (javni link)"], horizontal=True)
+    source = st.radio("Izvor", ["Upload Excel (.xlsx)", "Google Sheets link"], horizontal=True)
     workers = []
-
-    if source == "Upload Excel fajla (.xlsx)":
-        uploaded = st.file_uploader("Izaberi Excel fajl", type=["xlsx"])
-        if uploaded:
-            workers = load_workers_from_excel(uploaded.getvalue())
-            st.success(f"Učitano **{len(workers)}** radnika.")
+    if source.startswith("Upload"):
+        up = st.file_uploader("Excel fajl", type=["xlsx"])
+        if up:
+            workers = load_workers_from_excel(up.getvalue())
+            st.success(f"Učitano {len(workers)} radnika")
     else:
-        sheet_url = st.text_input("Nalepi link ka Google Sheets-u", placeholder="https://docs.google.com/spreadsheets/d/XXXX/edit")
-        if sheet_url:
+        url = st.text_input("Google Sheets URL")
+        if url:
             with st.spinner("Učitavam..."):
-                workers = load_workers_from_google_sheets(sheet_url)
+                workers = load_workers_from_google_sheets(url)
             if workers:
-                st.success(f"Učitano **{len(workers)}** radnika.")
+                st.success(f"Učitano {len(workers)} radnika")
 
     if workers:
-        st.subheader("2. Pregled")
-        st.dataframe(pd.DataFrame(workers)[["ime", "pozicija", "datum_pocetka", "datum_kraja", "mesto", "prevoz"]], use_container_width=True)
+        st.dataframe(pd.DataFrame(workers)[["ime", "pozicija", "datum_pocetka", "datum_kraja", "mesto"]], use_container_width=True)
         total = sum((parse_date(w["datum_kraja"]) - parse_date(w["datum_pocetka"])).days + 1 for w in workers)
-        st.info(f"Biće generisano **{total}** PDF naloga.")
-        st.subheader("3. Generisanje")
+        st.info(f"Generisaće se **{total}** PDF-ova")
         if st.button("🚀 GENERIŠI PDF NALOGE", type="primary", use_container_width=True):
-            with st.spinner(f"Generišem {total} PDF-ova..."):
+            with st.spinner("Generišem..."):
                 try:
-                    zip_bytes = generate_pdfs(workers)
-                    st.success(f"✅ Generisano **{total}** PDF naloga!")
-                    st.download_button("⬇️ Preuzmi ZIP", data=zip_bytes,
+                    z = generate_pdfs(workers)
+                    st.success(f"✅ {total} PDF-ova spremno")
+                    st.download_button("⬇️ Preuzmi ZIP", data=z,
                         file_name=f"putni_nalozi_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
                         mime="application/zip", use_container_width=True)
                 except Exception as e:
@@ -315,12 +265,6 @@ with tab1:
                     st.exception(e)
 
 with tab2:
-    st.markdown("""
-**Struktura PDF-a (ista logika kao originalni obrazac):**
-- Strana 1: Nalog za službeno putovanje + Putni račun
-- Strana 2: Izveštaj sa službenog puta
+    st.markdown("Koristi se **originalni PDF obrazac**. Font DejaVu je ugrađen da bi se sav tekst (uključujući ć, č, š, ž, đ) lepo video.")
 
-Sva polja su potpuno vidljiva, sa podrškom za srpska slova.
-""")
-
-st.caption("Business Centre - Gold Guard")
+st.caption("Originalni template + ugrađeni Unicode font")
