@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Streamlit – originalni PDF obrazac.
-Vrednosti se upisuju, appearance se NE generiše od nas –
-čitač (Chrome/Adobe) sam iscrtava tekst lepo (kao kad klikneš u polje).
+Vrednosti se upisuju + appearance se generiše (podaci se vide odmah).
+Unicode font (DejaVu) + NeedAppearances za bolji prikaz srpskih slova.
 """
 
 import streamlit as st
@@ -103,26 +103,35 @@ def create_nalog_bytes(worker: dict, day: datetime) -> bytes:
         "fill_16_2": worker["zadatak"],
     }
 
-    # 1. Upiši vrednosti (bez generisanja appearance-a)
+    # Polja sa srpskim slovima / dužim tekstom
+    unicode_fields = {
+        "fill_7", "fill_8", "fill_21", "fill_24", "fill_34", "fill_33",
+        "fill_6_2", "fill_8_2", "fill_33_2", "fill_2_2", "fill_13", "fill_16_2",
+        "fill_2", "fill_3_2", "fill_17", "fill_24_2",
+    }
+
+    # Upiši vrednosti + generiši appearance (da se podaci vide odmah)
     for page in doc:
         for w in page.widgets():
-            if w.field_name in values:
-                w.field_value = values[w.field_name]
+            if w.field_name not in values:
+                continue
+            w.field_value = values[w.field_name]
 
-    # 2. Obriši postojeće /AP streamove → čitač mora da regeneriše
-    for page in doc:
-        for w in page.widgets():
-            if w.field_name in values:
-                try:
-                    xref = w.xref
-                    if xref:
-                        ap = doc.xref_get_key(xref, "AP")
-                        if ap and ap[0] != "null":
-                            doc.xref_set_key(xref, "AP", "null")
-                except Exception:
-                    pass
+            if w.field_name in unicode_fields:
+                w.text_font = "F0"
+                w.text_fontsize = 8.5
+            elif w.field_name in ("fill_3", "fill_6", "fill_10", "fill_11_2",
+                                  "fill_20", "fill_25", "fill_35", "fill_29_2"):
+                w.text_fontsize = 8.0
+            else:
+                w.text_fontsize = 9.0
 
-    # 3. NeedAppearances = True  (najvažnije)
+            try:
+                w.update()  # generiše appearance → podaci se vide
+            except Exception:
+                pass
+
+    # NeedAppearances pomaže čitačima da ispravno prikažu polja
     doc.need_appearances = True
 
     pdf_bytes = doc.tobytes(garbage=3, deflate=True)
