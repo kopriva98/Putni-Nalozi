@@ -49,7 +49,7 @@ def format_amount(val) -> str:
 def create_nalog_bytes(worker: dict, day: datetime) -> bytes:
     doc = pymupdf.open(str(TEMPLATE_PATH))
 
-    # Ugradi font (pomaže nekim čitačima)
+    # Ugradi Unicode font
     if FONT_PATH.exists():
         for page in doc:
             try:
@@ -103,21 +103,24 @@ def create_nalog_bytes(worker: dict, day: datetime) -> bytes:
         "fill_16_2": worker["zadatak"],
     }
 
-    # Polja sa srpskim slovima / dužim tekstom
-    unicode_fields = {
-        "fill_7", "fill_8", "fill_21", "fill_24", "fill_34", "fill_33",
-        "fill_6_2", "fill_8_2", "fill_33_2", "fill_2_2", "fill_13", "fill_16_2",
-        "fill_2", "fill_3_2", "fill_17", "fill_24_2",
+    # Polja koja Chrome/Adobe lepo iscrtaju tek kad sami regenerišu appearance
+    force_viewer_ap = {
+        "fill_7", "fill_6_2",
+        "fill_8", "fill_8_2",
+        "fill_21", "fill_33_2",
+        "fill_24", "fill_34",
+        "fill_2_2",
     }
 
-    # Upiši vrednosti + generiši appearance (da se podaci vide odmah)
+    # 1) Upiši SVE vrednosti (podaci moraju biti popunjeni)
     for page in doc:
         for w in page.widgets():
             if w.field_name not in values:
                 continue
             w.field_value = values[w.field_name]
-
-            if w.field_name in unicode_fields:
+            if w.field_name in force_viewer_ap or w.field_name in (
+                "fill_33", "fill_13", "fill_16_2", "fill_2", "fill_3_2", "fill_17", "fill_24_2"
+            ):
                 w.text_font = "F0"
                 w.text_fontsize = 8.5
             elif w.field_name in ("fill_3", "fill_6", "fill_10", "fill_11_2",
@@ -125,18 +128,32 @@ def create_nalog_bytes(worker: dict, day: datetime) -> bytes:
                 w.text_fontsize = 8.0
             else:
                 w.text_fontsize = 9.0
-
             try:
-                w.update()  # generiše appearance → podaci se vide
+                w.update()
             except Exception:
                 pass
 
-    # NeedAppearances pomaže čitačima da ispravno prikažu polja
+    # 2) Za problematična polja obriši appearance → čitač generiše lep prikaz pri otvaranju
+    for page in doc:
+        for w in page.widgets():
+            if w.field_name not in force_viewer_ap:
+                continue
+            try:
+                xref = w.xref
+                if xref:
+                    ap = doc.xref_get_key(xref, "AP")
+                    if ap and ap[0] != "null":
+                        doc.xref_set_key(xref, "AP", "null")
+            except Exception:
+                pass
+
+    # 3) NeedAppearances na dokumentu
     doc.need_appearances = True
 
     pdf_bytes = doc.tobytes(garbage=3, deflate=True)
     doc.close()
     return pdf_bytes
+
 
 
 def load_workers_from_excel(file_bytes):
